@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+"""fastnetwork - a simple internet speed test for the terminal.
+
+Needs only Python 3. Does not use fast.com.
+Test server: speed.cloudflare.com
+"""
+import errno
+import http.client
+import json
+import os
+import shutil
+import signal
+import socket
+import ssl
+import statistics
+import struct
+import sys
+import threading
+import time
+from urllib.parse import urlsplit
+
+# ----------------------------------------------------------------------------
+# Settings (the test is the same every time)
+# ----------------------------------------------------------------------------
+SERVER = os.environ.get("FASTNETWORK_SERVER", "https://speed.cloudflare.com")
+PORTAL_CHECK = ("connectivitycheck.gstatic.com", "/generate_204")
+HEADERS = {"User-Agent": "fastnetwork/1.0"}
+CHUNK = 64 * 1024
+
+MODES = {
+    "normal": dict(pings=20, conns=6, seconds=10, warmup=2.0,
+                   down_cap=None, up_cap=None,
+                   down_req=25_000_000, up_req=10_000_000, sndbuf=512 * 1024),
+    "mobile": dict(pings=10, conns=4, seconds=5, warmup=1.0,
+                   down_cap=10_000_000, up_cap=3_000_000,
+                   down_req=1_000_000, up_req=500_000, sndbuf=128 * 1024),
+}
+
+# key: (exit code, title, what happened, what to do)
+PROBLEMS = {
+    "NO_NETWORK": (1, "NOT CONNECTED",
+                   "Your computer is not connected to any network.",
+                   "Turn on Wi-Fi or plug in a cable. Then try again."),
+    "NO_INTERNET": (2, "NO INTERNET",
+                    "You are connected to a network, but it has no internet.",
+                    "Check the modem or ask the staff. Try again in a minute."),
+    "DNS": (3, "DNS PROBLEM",
+            "The internet works, but website names cannot be found.",
+            "Reconnect to the Wi-Fi. If it does not help, set your DNS to 1.1.1.1."),
+    "LOGIN": (4, "WI-FI LOGIN NEEDED",
+              "This Wi-Fi wants you to log in or accept rules first.",
+              "Open any website in your browser and log in. Then try again."),
+    "SECURE": (5, "HTTPS FAILED",
+               "A safe (HTTPS) connection could not be made.",
+               "Check your computer's date and time. On public Wi-Fi, open your browser and log in."),
+    "BLOCKED": (6, "TEST SERVER BLOCKED",
+                "The internet works, but this network blocks the test server.",
+                "Try another network. A firewall, proxy or VPN can cause this."),
+    "BUSY": (7, "SERVER BUSY",
+             "The test server said 'too many tests' or had an error.",
+             "Wait 5 minutes. Then try again."),
+    "LOST": (8, "CONNECTION LOST",
+             "The connection stopped in the middle of the test.",
+             "The connection is not stable. Move closer to the Wi-Fi and try again."),
+    "TOO_SLOW": (9, "TOO SLOW",
+                 "Almost no data came. The connection is too slow to measure.",
+                 "The internet is almost not working here. Try another network."),
+    "WRONG_OPTION": (10, "WRONG OPTION",
+                     "You typed an option that does not exist.",
+                     "Use: fastnetwork, fastnetwork --mobile or fastnetwork --help"),
+}
+EXIT_CANCELLED = 130
+
+# ----------------------------------------------------------------------------
+# Colors (off when output is not a terminal, or NO_COLOR is set)
+# ----------------------------------------------------------------------------
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def paint(code, text):
+    return f"\033[{code}m{text}\033[0m" if COLOR else text
+
+
+def bold(t): return paint("1", t)
+def dim(t): return paint("2", t)
+def green(t): return paint("32", t)
+def yellow(t): return paint("33", t)
+def red(t): return paint("31", t)
+def cyan(t): return paint("36", t)
+
+
+# ----------------------------------------------------------------------------
+# Status bar fixed at the bottom of the terminal (same method as apt)
+# ----------------------------------------------------------------------------
+class BottomBar:
+    def __init__(self):
+        self.on = False
+        self.rows = 0
+        self.last = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        if not sys.stdout.isatty():
+            return
+        cols, rows = shutil.get_terminal_size((80, 24))
+        if rows < 5 or cols < 40:
+            return  # terminal too small: no bar, plain text only
+        self.rows = rows
+        # Make room, keep the last line out of the scroll area, hide cursor.
+        sys.stdout.write("\n\0337\033[1;%dr\0338\033[1A\033[?25l" % (rows - 1))
+        sys.stdout.flush()
+        self.on = True
+        try:
+            signal.signal(signal.SIGWINCH, self._resized)
+        except (AttributeError, ValueError):
+            pass
+
+    def _resized(self, *_):
+        with self.lock:
+            if not self.on:
+                return
+            self.rows = shutil.get_terminal_size((80, 24)).lines
+            sys.stdout.write("\0337\033[1;%dr\0338" % (self.rows - 1))
+            sys.stdout.flush()
+        if self.last:
+            self.draw(*self.last)
+
+    def draw(self, percent, label, text, color="42;30"):
+        self.last = (percent, label, text, color)
+        if not self.on:
+            return
+        with self.lock:
+            cols = shutil.get_terminal_size((80, 24)).columns
+            left = f"{label}: [{int(percent):3d}%]"
+            right = f" {text}"
+            width = cols - len(left) - len(right) - 4
+            bar = ""
+            if width >= 10:
+                full = int(width * min(max(percent, 0), 100) / 100)
+                bar = " [" + "#" * full + "." * (width - full) + "]"
+            line = f"\033[{color}m{left}\033[0m{bar}\033[1m{right}\033[0m"
+            sys.stdout.write("\0337\033[%d;1H\033[2K%s\0338" % (self.rows, line))
+            sys.stdout.flush()
+
+    def print(self, text=""):
+        with self.lock:
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+
+    def stop(self):
+        with self.lock:
+            if not self.on:
+                return
+            sys.stdout.write("\0337\033[r\0338\0337\033[%d;1H\033[2K\0338\033[?25h" % self.rows)
+            sys.stdout.flush()
+            self.on = False
+
+
+# ----------------------------------------------------------------------------
+# Errors
+# ----------------------------------------------------------------------------
+class Problem(Exception):
+    def __init__(self, key, detail=None):
+        super().__init__(key)
+        self.key = key
+        self.detail = detail
+
+
+class HttpError(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
+def classify(e):
+    """Turn any error into one of the known problems."""
+    if isinstance(e, Problem):
+        return e
+    if isinstance(e, HttpError):
+        if e.status == 429 or e.status >= 500:
+            return Problem("BUSY", f"HTTP {e.status}")
+        return Problem("BLOCKED", f"HTTP {e.status}")
+    if isinstance(e, ssl.SSLCertVerificationError):
+        msg = str(e).lower()
+        if "expired" in msg or "not yet valid" in msg:
+            return Problem("SECURE", "Your computer's date or time is probably wrong.")
+        return Problem("SECURE", "The certificate is not trusted. The network may be changing your traffic.")
+    if isinstance(e, ssl.SSLError):
+        return Problem("SECURE", getattr(e, "reason", None) or str(e))
+    if isinstance(e, socket.gaierror):
+        return Problem("DNS")
+    if isinstance(e, ConnectionRefusedError):
+        return Problem("BLOCKED", "Connection refused")
+    if isinstance(e, OSError) and e.errno in (errno.ENETUNREACH, errno.ENETDOWN):
+        return Problem("NO_NETWORK")
+    return Problem("LOST", type(e).__name__)
+
+
+# ----------------------------------------------------------------------------
+# Network helpers
+# ----------------------------------------------------------------------------
+_u = urlsplit(SERVER)
+HOST, PORT, PATH = _u.hostname, _u.port, _u.path.rstrip("/")
+HTTPS = _u.scheme == "https"
+SSL_CTX = ssl.create_default_context() if HTTPS else None
+
+
+def connect(timeout=10, sndbuf=None):
+    if HTTPS:
+        c = http.client.HTTPSConnection(HOST, PORT, timeout=timeout, context=SSL_CTX)
+    else:
+        c = http.client.HTTPConnection(HOST, PORT, timeout=timeout)
+    c.connect()
+    if sndbuf:
+        # Small send buffer: mobile mode does not send more than needed.
+        c.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+    return c
+
+
+def close(c):
+    try:
+        if c:
+            c.close()
+    except Exception:
+        pass
+
+
+def has_route():
+    """Is there any network at all? (No packet is sent.)"""
+    for fam, ip in ((socket.AF_INET, "1.1.1.1"), (socket.AF_INET6, "2606:4700:4700::1111")):
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as s:
+                s.connect((ip, 53))
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def tcp_ok(fam, addr, timeout=3):
+    try:
+        with socket.socket(fam, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(addr)
+            return True
+    except OSError:
+        return False
+
+
+def internet_ok():
+    """Can we reach the internet by IP address (without DNS)?"""
+    return (tcp_ok(socket.AF_INET, ("1.1.1.1", 443))
+            or tcp_ok(socket.AF_INET6, ("2606:4700:4700::1111", 443)))
+
+
+def dns_ok(host, timeout=5):
+    box = {}
+
+    def run():
+        try:
+            box["ok"] = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return "ok" in box
+
+
+def login_page():
+    """Wi-Fi login pages change this answer (it should be 204 No Content)."""
+    try:
+        c = http.client.HTTPConnection(PORTAL_CHECK[0], 80, timeout=5)
+        c.request("GET", PORTAL_CHECK[1], headers=HEADERS)
+        r = c.getresponse()
+        r.read(4096)
+        c.close()
+        return r.status != 204
+    except Exception:
+        return False  # cannot tell; continue
+
+
+def get(conn, path):
+    conn.request("GET", PATH + path, headers=HEADERS)
+    r = conn.getresponse()
+    body = r.read()
+    if r.status != 200:
+        raise HttpError(r.status)
+    return r, body
+
+
+def server_info():
+    conn = connect(8)
+    try:
+        info = {}
+        try:
+            _, body = get(conn, "/meta")
+            info = json.loads(body)
+        except (ValueError, HttpError) as e:
+            if isinstance(e, HttpError) and (e.status == 429 or e.status >= 500):
+                raise
+        try:
+            _, body = get(conn, "/cdn-cgi/trace")
+            for line in body.decode(errors="replace").splitlines():
+                k, _, v = line.partition("=")
+                info.setdefault("trace_" + k, v)
+        except (ValueError, HttpError):
+            pass
+        return info
+    finally:
+        close(conn)
+
+
+def ping(conn):
+    """One tiny request. Returns round trip time in ms (server work removed)."""
+    t = time.perf_counter()
+    r, _ = get(conn, "/__down?bytes=0")
+    ms = (time.perf_counter() - t) * 1000
+    st = r.getheader("Server-Timing") or ""
+    if "dur=" in st:
+        try:
+            ms -= float(st.split("dur=")[1].split(",")[0].split(";")[0])
+        except ValueError:
+            pass
+    return max(ms, 0.0)
+
+
+def queued(sock):
+    """Bytes we sent that the server has not received yet."""
+    try:
+        if sys.platform.startswith("linux"):
+            import fcntl
+            import termios
+            return struct.unpack("i", fcntl.ioctl(sock.fileno(), termios.TIOCOUTQ, b"\0" * 4))[0]
+        if sys.platform == "darwin":
+            return sock.getsockopt(socket.SOL_SOCKET, 0x1024)  # SO_NWRITE
+    except Exception:
+        pass
+    return 0
+
+
+class Counter:
+    def __init__(self, cap):
+        self.n = 0
+        self.cap = cap
+        self.done_at = None
+        self.socks = set()  # upload sockets
+        self.lock = threading.Lock()
+
+    def add(self, k):
+        """Returns True when the data limit (mobile mode) is reached."""
+        with self.lock:
+            self.n += k
+            if self.cap and self.n >= self.cap:
+                if self.done_at is None:
+                    self.done_at = time.monotonic()
+                return True
+            return False
+
+    def sent(self):
+        with self.lock:
+            return self.n
+
+    def get(self):
+        """Bytes that really arrived (for upload: minus bytes still waiting)."""
+        n = self.sent()
+        for s in list(self.socks):
+            n -= queued(s)
+        return max(n, 0)
+
+
+def mbps(nbytes, seconds):
+    return nbytes * 8 / seconds / 1e6 if seconds > 0 else 0.0
+
+
+def fmt_speed(m):
+    if m is None:
+        return "-"
+    if m >= 1000:
+        return f"{m / 1000:.2f} Gbps"
+    if m >= 100:
+        return f"{m:.0f} Mbps"
+    return f"{m:.1f} Mbps"
+
+
+# ----------------------------------------------------------------------------
+# Workers
+# ----------------------------------------------------------------------------
+def download_worker(stop, counter, errors, cfg):
+    conn = None
+    while not stop.is_set():
+        try:
+            if conn is None:
+                conn = connect()
+            conn.request("GET", f"{PATH}/__down?bytes={cfg['down_req']}", headers=HEADERS)
+            r = conn.getresponse()
+            if r.status != 200:
+                r.read()
+                raise HttpError(r.status)
+            while not stop.is_set():
+                b = r.read(CHUNK)
+                if not b:
+                    break
+                if counter.add(len(b)):
+                    stop.wait()  # data limit reached: stop reading
+            if stop.is_set():
+                break
+        except Exception as e:
+            errors.append(e)
+            close(conn)
+            conn = None
+            stop.wait(0.5)
+    close(conn)
+
+
+UPLOAD_DATA = os.urandom(CHUNK)
+
+
+def upload_worker(stop, counter, errors, cfg):
+    conn = None
+    size = cfg["up_req"]
+    while not stop.is_set():
+        try:
+            if conn is None:
+                conn = connect(sndbuf=cfg["sndbuf"])
+                counter.socks.add(conn.sock)
+            conn.putrequest("POST", PATH + "/__up")
+            for k, v in HEADERS.items():
+                conn.putheader(k, v)
+            conn.putheader("Content-Type", "application/octet-stream")
+            conn.putheader("Content-Length", str(size))
+            conn.endheaders()
+            left = size
+            while left > 0 and not stop.is_set():
+                n = min(CHUNK, left)
+                conn.send(UPLOAD_DATA[:n])
+                left -= n
+                if counter.add(n):
+                    stop.wait()  # data limit reached: let the rest arrive
+            if stop.is_set():
+                break
+            r = conn.getresponse()
+            r.read()
+            if r.status != 200:
+                raise HttpError(r.status)
+        except Exception as e:
+            errors.append(e)
+            if conn:
+                counter.socks.discard(conn.sock)
+            close(conn)
+            conn = None
+            stop.wait(0.5)
+    if conn:
+        counter.socks.discard(conn.sock)
+    close(conn)
+
+
+def busy_ping_worker(stop, results):
+    conn = None
+    while not stop.is_set():
+        try:
+            if conn is None:
+                conn = connect(3)
+                ping(conn)  # first one includes the handshake; skip it
+            results.append(ping(conn))
+        except Exception:
+            close(conn)
+            conn = None
+        stop.wait(0.4)
+    close(conn)
+
+
+# ----------------------------------------------------------------------------
+# Test steps
+# ----------------------------------------------------------------------------
+def check_network(bar):
+    bar.draw(0, "Checking", "network...", "43;30")
+    if not has_route():
+        raise Problem("NO_NETWORK")
+    bar.draw(20, "Checking", "DNS...", "43;30")
+    if not dns_ok(HOST):
+        raise Problem("DNS") if internet_ok() else Problem("NO_INTERNET")
+    bar.draw(40, "Checking", "Wi-Fi login page...", "43;30")
+    if login_page():
+        raise Problem("LOGIN")
+    bar.draw(70, "Checking", "test server...", "43;30")
+    try:
+        info = server_info()
+    except Exception as e:
+        p = classify(e)
+        if p.key in ("LOST", "BLOCKED") and HTTPS:
+            p = Problem("BLOCKED", p.detail) if internet_ok() else Problem("NO_INTERNET")
+        raise p
+    bar.draw(100, "Checking", "ok", "43;30")
+    return info
+
+
+def measure_ping(bar, count):
+    times, fails, conn, last_err = [], 0, None, None
+    for i in range(count):
+        try:
+            if conn is None:
+                conn = connect(3)
+                ping(conn)  # warm up (connection + TLS), not counted
+            times.append(ping(conn))
+        except HttpError as e:
+            raise classify(e)
+        except Exception as e:
+            fails += 1
+            last_err = e
+            close(conn)
+            conn = None
+        text = f"{times[-1]:.1f} ms" if times else "..."
+        bar.draw((i + 1) / count * 100, "Ping", text, "44;97")
+        time.sleep(0.05)
+    close(conn)
+    if not times:
+        raise classify(last_err) if last_err else Problem("LOST")
+    jitter = statistics.mean(abs(a - b) for a, b in zip(times, times[1:])) if len(times) > 1 else 0.0
+    return statistics.median(times), jitter, fails / count * 100
+
+
+def stalled(errors):
+    """No data is moving. Decide which problem it is."""
+    if errors:
+        p = classify(errors[-1])
+        # It worked a moment ago, so "refused" now means the connection was lost.
+        if p.key in ("BUSY", "SECURE", "NO_NETWORK"):
+            return p
+    if not has_route():
+        return Problem("NO_NETWORK")
+    if not internet_ok():
+        return Problem("LOST")
+    if errors:
+        return Problem("LOST", type(errors[-1]).__name__)
+    return Problem("TOO_SLOW")
+
+
+def measure_transfer(bar, label, worker, cfg, cap, color):
+    counter = Counter(cap)
+    stop = threading.Event()
+    errors, busy = [], []
+    threads = [threading.Thread(target=worker, args=(stop, counter, errors, cfg), daemon=True)
+               for _ in range(cfg["conns"])]
+    threads.append(threading.Thread(target=busy_ping_worker, args=(stop, busy), daemon=True))
+    for t in threads:
+        t.start()
+
+    seconds, warmup = cfg["seconds"], cfg["warmup"]
+    t0 = time.monotonic()
+    samples = [(t0, 0)]
+    start = None
+    result = None
+    end = None
+    last_n, last_move, logged = 0, t0, 0
+    try:
+        while True:
+            time.sleep(0.02 if cap else 0.05)
+            t, n = time.monotonic(), counter.get()
+            el = t - t0
+            samples.append((t, n))
+            if n > last_n:
+                last_n, last_move = n, t
+
+            # Skip the slow start; measure only after it.
+            if start is None and (el >= warmup or (cap and n >= cap * 0.25)):
+                start = (t, n)
+            if start and t - start[0] > 0.05:
+                result = mbps(n - start[1], t - start[0])
+
+            old = next((s for s in samples if s[0] >= t - 1.5), samples[0])
+            live = mbps(n - old[1], t - old[0])
+
+            pct = el / seconds * 100
+            if cap:
+                pct = max(pct, n / cap * 100)
+            avg = fmt_speed(result) if result is not None else "measuring..."
+            bar.draw(min(pct, 99), label, f"{fmt_speed(live)}  (avg {avg})", color)
+
+            if int(el) > logged:
+                logged = int(el)
+                bar.print(f"  {dim(f'{label:<9}{logged:>3}s')}   now {fmt_speed(live):>11}"
+                          f"   avg {bold(f'{avg:>11}')}")
+
+            # Server said "no" (too many tests, blocked...): stop now.
+            http_errors = [e for e in errors if isinstance(e, HttpError)]
+            if http_errors:
+                raise classify(http_errors[-1])
+
+            # Mobile limit: stop when all limited data has arrived.
+            if cap and counter.sent() >= cap and n >= counter.sent():
+                end = counter.done_at if not counter.socks else t
+                break
+            # Nothing is moving: find out why.
+            if t - last_move > 6 or (n == 0 and el >= min(seconds, 8)):
+                raise stalled(errors)
+            if el >= seconds:
+                break
+    finally:
+        stop.set()
+
+    n = counter.get()
+    if end and start and end - start[0] > 0.05:
+        result = mbps(n - start[1], end - start[0])
+    if not result:
+        result = mbps(n, (end or time.monotonic()) - t0)
+    bar.draw(100, label, fmt_speed(result), color)
+    return result, counter.sent(), (statistics.median(busy) if busy else None)
+
+
+# ----------------------------------------------------------------------------
+# Words for results
+# ----------------------------------------------------------------------------
+def rate(value, steps, words):
+    for limit, word in zip(steps, words):
+        if value < limit:
+            return word
+    return words[-1]
+
+
+def rate_down(m): return rate(m, (1, 5, 25, 100), ("Very slow", "Slow", "OK", "Fast", "Very fast"))
+def rate_up(m): return rate(m, (1, 3, 10, 50), ("Very slow", "Slow", "OK", "Fast", "Very fast"))
+def rate_ping(ms): return rate(ms, (20, 50, 100, 200), ("Excellent", "Good", "OK", "High", "Very high"))
+def rate_jitter(ms): return rate(ms, (10, 30), ("Stable", "A little unstable", "Unstable"))
+
+
+def word_color(word):
+    if word in ("Very slow", "Very high", "Unstable", "Slow", "High"):
+        return red(word)
+    if word in ("OK", "A little unstable"):
+        return yellow(word)
+    return green(word)
+
+
+def report(r, mode, info):
+    dl, ul = r.get("down"), r.get("up")
+    pg, jt, loss = r.get("ping"), r.get("jitter"), r.get("loss")
+    busy = max((x for x in (r.get("busy_down"), r.get("busy_up")) if x is not None), default=None)
+
+    line = "-" * 52
+    print(line)
+    if dl is not None:
+        print(f"  Download     {bold(f'{fmt_speed(dl):>11}')}   {word_color(rate_down(dl))}")
+    if ul is not None:
+        print(f"  Upload       {bold(f'{fmt_speed(ul):>11}')}   {word_color(rate_up(ul))}")
+    if pg is not None:
+        print(f"  Ping         {pg:>8.0f} ms   {word_color(rate_ping(pg))}")
+        print(f"  Jitter       {jt:>8.0f} ms   {word_color(rate_jitter(jt))}")
+        print(f"  Lost pings   {loss:>8.0f} %")
+    if busy is not None:
+        print(f"  Busy ping    {busy:>8.0f} ms")
+    used = (r.get("down_bytes", 0) + r.get("up_bytes", 0)) / 1e6
+    print(f"  Data used    {used:>8.0f} MB")
+    print(line)
+
+    if dl is None or ul is None or pg is None:
+        return  # test did not finish; problem is printed after this
+
+    bloat = (busy - pg) if busy is not None else 0
+    checks = [
+        ("Web, email, music", dl >= 1),
+        ("HD video (1080p)", dl >= 5),
+        ("4K video", dl >= 25),
+        ("Video calls", dl >= 3 and ul >= 1.5 and pg < 150 and jt < 30 and loss < 5),
+        ("Online games", dl >= 3 and pg < 60 and jt < 20 and loss == 0 and bloat < 100),
+        ("Sending big files", ul >= 10),
+    ]
+    print("  What works here:")
+    for name, ok in checks:
+        print(f"    {green('YES') if ok else red('NO ')}  {name}")
+
+    oks = dict(checks)
+    if oks["Online games"] and oks["4K video"]:
+        status = green("EXCELLENT") + " - Everything works well."
+    elif oks["Video calls"] and oks["HD video (1080p)"]:
+        status = green("GOOD") + " - Good for work, calls and video."
+    elif oks["Web, email, music"]:
+        status = yellow("BASIC") + " - OK for web and email. Calls and video may have problems."
+    else:
+        status = red("POOR") + " - The internet is very slow here."
+    print(line)
+    print(f"  Status: {status}")
+
+    notes = []
+    if loss > 0:
+        notes.append(f"{loss:.0f}% of pings did not come back. The connection drops sometimes.")
+    if jt >= 30:
+        notes.append("Ping changes a lot. Calls may freeze.")
+    if bloat >= 100:
+        notes.append("When the internet is busy, it becomes slow to answer. Calls lag if someone downloads.")
+    if pg >= 150:
+        notes.append("Ping is high. Everything feels a little late.")
+    if info.get("trace_warp", "off") != "off" or "cloudflare" in str(info.get("asOrganization", "")).lower():
+        notes.append("You may be using a VPN. These results show the VPN speed.")
+    if mode == "mobile":
+        notes.append("Mobile mode: short test, results are a little less exact.")
+    for n in notes:
+        print(f"  {yellow('!')} {n}")
+
+
+def show_problem(p):
+    code, title, what, todo = PROBLEMS[p.key]
+    print()
+    print(f"  {red(bold('PROBLEM: ' + title))}  {dim(f'(exit code {code})')}")
+    print(f"  {what}")
+    if p.detail:
+        print(f"  {dim('Detail: ' + str(p.detail))}")
+    print(f"  {bold('What to do:')} {todo}")
+    return code
+
+
+# ----------------------------------------------------------------------------
+HELP = """\
+fastnetwork - test your internet speed
+
+USAGE
+  fastnetwork            Full test. Takes about 25 seconds.
+  fastnetwork --mobile   Small test for mobile data. Uses about 13 MB.
+  fastnetwork --help     Show this help.
+
+THE TEST IS THE SAME EVERY TIME
+  1. Check the network (Wi-Fi, DNS, login page, test server)
+  2. Ping: 20 times            (mobile: 10 times)
+  3. Download: 10 seconds      (mobile: max 10 MB)
+  4. Upload: 10 seconds        (mobile: max 3 MB)
+  Test server: speed.cloudflare.com (the closest one to you)
+  A normal test can use a lot of data on fast internet
+  (about 250 MB if download and upload are both 100 Mbps).
+  Use --mobile on mobile data.
+
+RESULTS
+  Download     How fast you GET data. Websites, videos and files use it.
+               Bigger is better. Mbps = megabits per second.
+  Upload       How fast you SEND data. Video calls and sending files use it.
+               Bigger is better.
+  Ping         Time for a small message to go and come back.
+               Smaller is better. ms = milliseconds (1000 ms = 1 second).
+  Jitter       How much the ping changes. Smaller is better.
+               Big jitter = calls and games are not smooth.
+  Lost pings   Pings that did not come back. 0 % is best.
+  Busy ping    Ping while the internet is busy (during the test).
+               If it is much bigger than Ping, calls lag when
+               someone downloads something.
+  Data used    How much internet data the test used.
+
+WORDS
+  Download (Mbps):  under 1 Very slow | 1-5 Slow | 5-25 OK | 25-100 Fast | 100+ Very fast
+  Upload (Mbps):    under 1 Very slow | 1-3 Slow | 3-10 OK | 10-50 Fast  | 50+ Very fast
+  Ping (ms):        under 20 Excellent | 20-50 Good | 50-100 OK | 100-200 High | 200+ Very high
+  Jitter (ms):      under 10 Stable | 10-30 A little unstable | 30+ Unstable
+
+STATUS
+  EXCELLENT    Everything works well, also games and 4K video.
+  GOOD         Good for work, video calls and HD video.
+  BASIC        OK for web and email. Calls and video may have problems.
+  POOR         The internet is very slow.
+
+PROBLEMS AND EXIT CODES
+  0    OK                    The test finished.
+{problems}
+  130  CANCELLED             You pressed Ctrl+C.
+"""
+
+
+def help_text():
+    rows = []
+    for code, title, what, _ in sorted(PROBLEMS.values()):
+        rows.append(f"  {code:<4} {title:<21} {what}")
+    return HELP.format(problems="\n".join(rows))
+
+
+def main():
+    args = sys.argv[1:]
+    if any(a in ("-h", "--help") for a in args):
+        print(help_text(), end="")
+        return 0
+    bad = [a for a in args if a not in ("--mobile", "-m")]
+    if bad:
+        return show_problem(Problem("WRONG_OPTION", " ".join(bad)))
+    mode = "mobile" if args else "normal"
+    cfg = MODES[mode]
+
+    bar = BottomBar()
+    results, info = {}, {}
+
+    def on_signal(*_):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, on_signal)
+
+    bar.start()
+    try:
+        bar.print(bold("fastnetwork") + dim(f"  ({mode} test)"))
+        info = check_network(bar)
+        where = ", ".join(x for x in (info.get("city"), info.get("country") or info.get("trace_loc")) if x)
+        isp = info.get("asOrganization")
+        server = info.get("colo") or info.get("trace_colo") or HOST
+        ip = info.get("clientIp") or info.get("trace_ip")
+        parts = [p for p in (isp, where, f"server {server}", f"IP {ip}" if ip else None) if p]
+        bar.print(dim("  " + "  |  ".join(parts)))
+        bar.print()
+
+        pg, jt, loss = measure_ping(bar, cfg["pings"])
+        results.update(ping=pg, jitter=jt, loss=loss)
+        bar.print(f"  {cyan('Ping')}     {pg:.0f} ms   jitter {jt:.0f} ms   lost {loss:.0f} %")
+        bar.print()
+
+        bar.print(f"  {green('Download')}")
+        dl, db, bd = measure_transfer(bar, "Download", download_worker, cfg, cfg["down_cap"], "42;30")
+        results.update(down=dl, down_bytes=db, busy_down=bd)
+        bar.print()
+
+        bar.print(f"  {green('Upload')}")
+        ul, ub, bu = measure_transfer(bar, "Upload", upload_worker, cfg, cfg["up_cap"], "44;97")
+        results.update(up=ul, up_bytes=ub, busy_up=bu)
+        bar.print()
+    except KeyboardInterrupt:
+        bar.stop()
+        print("\n  Cancelled.")
+        return EXIT_CANCELLED
+    except BrokenPipeError:
+        raise
+    except Exception as e:
+        bar.stop()
+        if results:
+            report(results, mode, info)
+        return show_problem(classify(e))
+
+    bar.stop()
+    report(results, mode, info)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.stdout.write("\033[r\033[?25h" if sys.stdout.isatty() else "")
+        print("\n  Cancelled.")
+        sys.exit(EXIT_CANCELLED)
+    except BrokenPipeError:
+        # Output was closed (for example: fastnetwork | head). Exit quietly.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
