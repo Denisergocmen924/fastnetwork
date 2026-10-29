@@ -69,7 +69,7 @@ and stop. `fastnetwork` tries to answer the question you actually have:
 You need Python 3.7 or newer. It is already installed on most Linux systems.
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/fastnetwork/main/fastnetwork \
+sudo curl -fsSL https://raw.githubusercontent.com/Denisergocmen924/fastnetwork/main/fastnetwork \
      -o /usr/local/bin/fastnetwork
 sudo chmod +x /usr/local/bin/fastnetwork
 ```
@@ -77,7 +77,7 @@ sudo chmod +x /usr/local/bin/fastnetwork
 Or clone the repo and copy the file:
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/fastnetwork.git
+git clone https://github.com/Denisergocmen924/fastnetwork.git
 sudo install -m 755 fastnetwork/fastnetwork /usr/local/bin/fastnetwork
 ```
 
