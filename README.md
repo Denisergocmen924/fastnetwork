@@ -5,6 +5,8 @@
 Made for cafés, hotels, co-working spaces and other shared Wi-Fi.
 One file. No dependencies. Just Python 3.
 
+![fastnetwork demo](docs/demo.gif)
+
 ```
 $ fastnetwork
 fastnetwork  (normal test)
